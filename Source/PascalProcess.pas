@@ -1,0 +1,809 @@
+{-----------------------------------------------------------------------------
+ Unit Name: PascalProcess
+ Author:    PyScripter (https://github.com/pyscripter)
+ License:   MIT
+-----------------------------------------------------------------------------}
+
+unit PascalProcess;
+
+interface
+uses
+  Winapi.Windows,
+  System.SysUtils,
+  System.SyncObjs,
+  System.Classes;
+
+type
+  /// <summary> Custom process exception </summary>
+  /// <remarks> All exceptions are converted to PPException </remarks>
+  PPException = class(Exception);
+
+  /// <summary> The different process priorities </summary>
+  TPProcessPriority = (
+    ppIdle,
+    ppNormal,
+    ppHigh,
+    ppRealTime,
+    ppBelowNormal,
+    ppAboveNormal
+  );
+
+  /// <summary>
+  /// Encapsulates different values for TStartupInfo.wShowWindow
+  /// See https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow
+  /// </summary>
+  TPPShowWindow = (
+    swHide,
+    swMaximize,
+    swMinimize,
+    swShow,
+    swShowMinimized,
+    swoshowMinNoActive,
+    swShowNA,
+    swShowNormal
+  );
+
+  TPPReadEvent = procedure(Sender: TObject; const Bytes: TBytes) of object;
+
+  IPProcess = interface
+  ['{02CBC80B-CCF2-410C-96BE-C7EBE88BD8A4}']
+    // property getters
+    function GetExitCode: Cardinal;
+    function GetException: PPException;
+    function GetOutput: TBytes;
+    function GetErrorOutput: TBytes;
+    function GetCommandLine: string;
+    function GetCurrentDir: string;
+    function GetBufferSize: Cardinal;
+    function GetEnvironment: TStrings;
+    function GetMergeError: Boolean;
+    function GetProcessPriority: TPProcessPriority;
+    function GetShowWindow: TPPShowWindow;
+    // property setters
+    procedure SetCommandLine(const Value: string);
+    procedure SetCurrentDir(const Value: string);
+    procedure SetBufferSize(const Value: Cardinal);
+    procedure SetEnvironment(const Value: TStrings);
+    procedure SetMergeError(const Value: Boolean);
+    procedure SetProcessPriority(const Value: TPProcessPriority);
+    procedure SetShowWindow(const Value: TPPShowWindow);
+    procedure SetOnRead(const Value: TPPReadEvent);
+    procedure SetOnErrorRead(const Value: TPPReadEvent);
+    procedure SetOnTerminate(const Value: TNotifyEvent);
+
+    // Procedures
+
+    /// <summary> Writes the Bytes to the stdin of the process </summary>
+    /// <remarks>
+    ///   Can be used before or during the execution of the process
+    /// </remarks>
+    procedure WriteProcessInput(Bytes: TBytes);
+
+    /// <summary> Executes the process asynchronously </summary>
+    procedure Execute;
+
+    /// <summary> Executes the process synchronously </summary>
+    procedure SyncExecute;
+
+    /// <summary> Terminates the running process </summary>
+    procedure Terminate;
+
+    // Input properties
+
+    /// <summary> The command line to be executed </summary>
+    /// <remarks>
+    ///   Unless the executable is on the system path, it should
+    ///   include the the full path to the executable even if
+    ///   CurrentDir is set.  It should also include any arguments.
+    /// </remarks>
+    property CommandLine: string read GetCommandLine write SetCommandLine;
+
+    /// <summary> The current directory for the created process </summary>
+    property CurrentDir: string read GetCurrentDir write SetCurrentDir;
+
+    /// <summary> The reading buffer size - default $4000 </summary>
+    property BufferSize: Cardinal read GetBufferSize write SetBufferSize;
+
+    /// <summary>
+    ///   If not empty, it should contain a custom environment
+    ///   for the created process.
+    /// </summary>
+    property Environment: TStrings read GetEnvironment write SetEnvironment;
+
+    /// <summary> If True the stderr output is merged with stdout </summary>
+    property MergeError: Boolean read GetMergeError write SetMergeError;
+
+    /// <summary> The process priority - default ppNormal</summary>
+    property ProcessPriority: TPProcessPriority read GetProcessPriority
+      write SetProcessPriority;
+
+    /// <summary>
+    ///   Determines the of TStartupInfo.wShowWindow - Default swHide
+    /// </summary>
+    property ShowWindow: TPPShowWindow read GetShowWindow write SetShowWindow;
+
+    // Output properties
+
+    /// <summary> The process exit code </summary>
+    property ExitCode: Cardinal read GetExitCode;
+
+    /// <summary> The process redirected output </summary>
+    /// <remarks>
+    ///   If you provide an OnRead event handler, it will handle the output
+    ///   and Output will be empty.
+    /// </remarks>
+    property Output: TBytes read GetOutput;
+
+    /// <summary>The process redirected error output </summary>
+    /// <remarks>
+    ///   If MergeError is True or if you provide an OnReadError event handler
+    ///   then it will be empty
+    /// </remarks>
+    property ErrorOutput: TBytes read GetErrorOutput;
+
+    /// <summary> A PPException if an error occured or nil otherwise </summary>
+    /// <remarks>
+    ///   If you get the exception you need to either raise it or destroy it
+    /// </remarks>
+    property Exception: PPException read GetException;
+    // Events
+
+    /// <summary> Event triggered when output is received </summary>
+    /// <remarks>
+    ///   It is executed inside the process thread. If MergeError is True
+    ///   then it is also triggered when error output is received.
+    /// </remarks>
+    property OnRead: TPPReadEvent write SetOnRead;
+
+    /// <summary>
+    ///   Event triggered when error output is received if MergeError is False
+    /// </summary>
+    /// <remarks> It is executed inside the process thread </remarks>
+    property OnErrorRead: TPPReadEvent write SetOnErrorRead;
+
+    /// <summary>
+    ///   Event triggered when the process terminates.
+    ///   It is executed inside the Main thread using Synchronize.
+    /// </summary>
+    property OnTerminate: TNotifyEvent write SetOnTerminate;
+  end;
+
+  TPProcess = class(TInterfacedObject, IPProcess)
+  private
+    // Fields
+    FExitCode: Cardinal;
+    FOutput: TBytes;
+    FErrorOutput: TBytes;
+    FCommandLine: string;
+    FCurrentDir: string;
+    FBufferSize: Cardinal;
+    FEnvironment: TStrings;
+    FMergeError: Boolean;
+    FProcessPriority: TPProcessPriority;
+    FShowWindow: TPPShowWindow;
+    FWriteBytes: TBytes;
+    FWriteLock: TRTLCriticalSection;
+    FWriteEvent: TSimpleEvent;
+    FExecThread: TThread;
+    FException: PPException;
+
+    FOnRead: TPPReadEvent;
+    FOnErrorRead: TPPReadEvent;
+    FOnTerminate: TNotifyEvent;
+
+    // property getters
+    function GetExitCode: Cardinal;
+    function GetException: PPException;
+    function GetOutput: TBytes;
+    function GetErrorOutput: TBytes;
+    function GetCommandLine: string;
+    function GetCurrentDir: string;
+    function GetBufferSize: Cardinal;
+    function GetEnvironment: TStrings;
+    function GetMergeError: Boolean;
+    function GetProcessPriority: TPProcessPriority;
+    function GetShowWindow: TPPShowWindow;
+    // property setters
+    procedure SetCommandLine(const Value: string);
+    procedure SetCurrentDir(const Value: string);
+    procedure SetBufferSize(const Value: Cardinal);
+    procedure SetEnvironment(const Value: TStrings);
+    procedure SetMergeError(const Value: Boolean);
+    procedure SetProcessPriority(const Value: TPProcessPriority);
+    procedure SetShowWindow(const Value: TPPShowWindow);
+    procedure SetOnRead(const Value: TPPReadEvent);
+    procedure SetOnErrorRead(const Value: TPPReadEvent);
+    procedure SetOnTerminate(const Value: TNotifyEvent);
+    // Procedures
+    procedure ThreadTerminate(Sender: TObject);
+    procedure WriteProcessInput(Bytes: TBytes);
+    procedure Execute;
+    procedure SyncExecute;
+    procedure Terminate;
+  public
+    constructor Create(ACommandLine: string; ACurrentDir: string = '');
+    destructor Destroy; override;
+  end;
+
+implementation
+
+resourcestring
+  rsEmptyEnvString = 'Environment strings cannot be empty';
+
+{$REGION 'Support routines'}
+
+// Closes handle if valid and ensures it becomes zero
+procedure SafeCloseHandle(var Handle: THandle);
+begin
+  if Handle <> 0 then
+  begin
+    CloseHandle(Handle);
+    Handle := 0;
+  end;
+end;
+
+// Ensures hReadPipe and hWritePipe are zero on failure
+function SafeCreatePipe(var hReadPipe, hWritePipe: THandle;
+  lpPipeAttributes: PSecurityAttributes; nSize: DWORD): BOOL;
+begin
+  Result := CreatePipe(hReadPipe, hWritePipe, lpPipeAttributes, nSize);
+  if not Result then
+  begin
+    hReadPipe := 0;
+    hWritePipe := 0;
+  end;
+end;
+
+// Ensures the target handle is zero on failure
+function SafeDuplicateHandle(hSourceProcessHandle, hSourceHandle,
+  hTargetProcessHandle: THandle; lpTargetHandle: PHandle; dwDesiredAccess: DWORD;
+  bInheritHandle: BOOL; dwOptions: DWORD): BOOL;
+begin
+  Result := DuplicateHandle(hSourceProcessHandle, hSourceHandle,
+    hTargetProcessHandle, lpTargetHandle, dwDesiredAccess, bInheritHandle,
+    dwOptions);
+  if not Result and Assigned(lpTargetHandle) then
+    lpTargetHandle^ := 0;
+end;
+
+var
+  AsyncPipeCounter: Integer = 0;
+
+// Helper routine to create asynchronous pipes.  From Jcl JclSysUtils
+// Ensures output pipes are zero on failure
+function CreateAsyncPipe(var hReadPipe, hWritePipe: THandle;
+  lpPipeAttributes: PSecurityAttributes; nSize: DWORD): BOOL;
+var
+  Error: DWORD;
+  PipeReadHandle, PipeWriteHandle: THandle;
+  PipeName: string;
+begin
+  Result := False;
+
+  hReadPipe := 0;
+  hWritePipe := 0;
+
+  if nSize = 0 then
+    nSize := 4096;
+
+  // Unique name
+  AtomicIncrement(AsyncPipeCounter);
+  PipeName := Format('\\.\Pipe\AsyncAnonPipe.%.8x.%.8x.%.8x',
+    [GetCurrentProcessId, GetCurrentThreadId, AsyncPipeCounter]);
+
+  PipeReadHandle := CreateNamedPipe(PChar(PipeName), PIPE_ACCESS_INBOUND or FILE_FLAG_OVERLAPPED,
+      PIPE_TYPE_BYTE or PIPE_WAIT, 1, nSize, nSize, 120 * 1000, lpPipeAttributes);
+  if PipeReadHandle = INVALID_HANDLE_VALUE then
+    Exit;
+
+  PipeWriteHandle := CreateFile(PChar(PipeName), GENERIC_WRITE, 0, lpPipeAttributes, OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL {or FILE_FLAG_OVERLAPPED}, 0);
+  if PipeWriteHandle = INVALID_HANDLE_VALUE then
+  begin
+    Error := GetLastError;
+    CloseHandle(PipeReadHandle);
+    SetLastError(Error);
+    Exit;
+  end;
+
+  hReadPipe := PipeReadHandle;
+  hWritePipe := PipeWriteHandle;
+
+  Result := True;
+end;
+
+// From JclStrings
+function StringsToMultiSz(var Dest: PChar; const Source: TStrings): PChar;
+var
+  I, TotalLength: Integer;
+  P: PChar;
+begin
+  Assert((Source <> nil) and (Source.Count > 0), 'StringsToMultiSz');
+  TotalLength := 1;
+  for I := 0 to Source.Count - 1 do
+    if Source[I] = '' then
+      raise PPException.CreateRes(@rsEmptyEnvString)
+    else
+      Inc(TotalLength, StrLen(PChar(Source[I])) + 1);
+  GetMem(Dest, TotalLength * SizeOf(Char));
+  P := Dest;
+  for I := 0 to Source.Count - 1 do
+  begin
+    P := StrECopy(P, PChar(Source[I]));
+    Inc(P);
+  end;
+  P^ := #0;
+  Result := Dest;
+end;
+
+{$ENDREGION 'Support routines'}
+
+
+{$REGION 'TProcessThread'}
+type
+  TProcessThread = class(TThread)
+  private
+    FProcess: TPProcess;
+    FProcessInformation: TProcessInformation;
+    FOutputStream: TBytesStream;
+    FErrorOutputStream: TBytesStream;
+    procedure ReadOutput(Bytes: TBytes);
+    procedure ReadErrorOutput(Bytes: TBytes);
+  protected
+    procedure TerminatedSet; override;
+    procedure Execute; override;
+  public
+    constructor Create(Process: TPProcess);
+    destructor Destroy; override;
+  end;
+
+
+constructor TProcessThread.Create(Process: TPProcess);
+begin
+  inherited Create(False);
+  FProcess := Process;
+
+  FOutputStream := TBytesStream.Create([]);
+  FErrorOutputStream := TBytesStream.Create([]);
+
+  OnTerminate := FProcess.ThreadTerminate;
+  FreeOnTerminate := False;
+end;
+
+type
+  TOnReadProc = procedure(Bytes: TBytes) of object;
+
+  PExtOverlapped = ^TExtOverlapped;
+  TExtOverlapped = record
+    Overlapped: TOverlapped;
+    Process: TPProcess;
+    Buffer: TBytes;
+    OnReadProc: TOnReadProc;
+    PipeHandle: PHandle;
+  end;
+
+// Completion routine for ReadFileEx
+procedure ReadCompletionRoutine(dwErrorCode: DWORD; dwNumberOfBytesTransfered: DWORD;
+  lpOverlapped: POverlapped); stdcall;
+begin
+  // Check for errors or pipe closure
+  if dwErrorCode <> 0 then
+  begin
+    SafeCloseHandle(PExtOverlapped(lpOverlapped).PipeHandle^);
+    Exit;
+  end;
+
+  // Process received data
+  if dwNumberOfBytesTransfered > 0 then
+    PExtOverlapped(lpOverlapped).OnReadProc(
+      Copy(PExtOverlapped(lpOverlapped).Buffer, 0, dwNumberOfBytesTransfered));
+
+  ZeroMemory(lpOverlapped, SizeOf(TOverlapped));
+
+  // Issue another read
+  if not ReadFileEx(
+    PExtOverlapped(lpOverlapped).PipeHandle^,
+    @PExtOverlapped(lpOverlapped).Buffer[0],
+    Length(PExtOverlapped(lpOverlapped).Buffer),
+    lpOverlapped,
+    @ReadCompletionRoutine)
+  then
+    SafeCloseHandle(PExtOverlapped(lpOverlapped).PipeHandle^);
+end;
+
+destructor TProcessThread.Destroy;
+begin
+  FOutputStream.Free;
+  FErrorOutputStream.Free;
+  inherited;
+end;
+
+procedure TProcessThread.Execute;
+const
+  ShowWindowValues: array [TPPShowWindow] of DWORD =
+    (SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWMINIMIZED,
+     SW_SHOWMINNOACTIVE, SW_SHOWNA, SW_SHOWNORMAL);
+  ProcessPriorities: array [TPProcessPriority] of DWORD =
+    (IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+     REALTIME_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
+     ABOVE_NORMAL_PRIORITY_CLASS);
+var
+  StartupInfo: TStartupInfo;
+  SecurityAttributes: TSecurityAttributes;
+  ReadHandle, WriteHandle: THandle;
+  ErrorReadHandle, ErrorWriteHandle: THandle;
+  StdInReadPipe, StdInWriteTmpPipe, StdInWritePipe: THandle;
+  BytesWritten: DWORD;
+  ExtOverlapped, ExtOverlappedError: TExtOverlapped;
+  PCurrentDir: PChar;
+  EnvironmentData: PChar;
+  Flags: DWORD;
+begin
+  SecurityAttributes.nLength := sizeof(SECURITY_ATTRIBUTES);
+  SecurityAttributes.lpSecurityDescriptor := nil;
+  SecurityAttributes.bInheritHandle := True;
+
+  StdInWritePipe := 0;
+  ReadHandle := 0;
+  WriteHandle := 0;
+  try
+  // Create pipe for writing
+    if not SafeCreatePipe(StdInReadPipe, StdInWriteTmpPipe, @SecurityAttributes, 0) then
+      RaiseLastOSError;
+
+    if not SafeDuplicateHandle(GetCurrentProcess, StdInWriteTmpPipe, GetCurrentProcess,
+      @StdInWritePipe, 0, False, DUPLICATE_SAME_ACCESS)
+    then
+      RaiseLastOSError;
+
+    // Create async pipe for reading stdout
+    if not CreateAsyncPipe(ReadHandle, WriteHandle, @SecurityAttributes, FProcess.FBufferSize) then
+      RaiseLastOSError;
+
+    // Create async pipe for reading stderror
+    if not CreateAsyncPipe(ErrorReadHandle, ErrorWriteHandle, @SecurityAttributes, FProcess.FBufferSize) then
+      RaiseLastOSError;
+  except
+    SafeCloseHandle(StdInReadPipe);
+    SafeCloseHandle(StdInWriteTmpPipe);
+    SafeCloseHandle(StdInWritePipe);
+    SafeCloseHandle(ReadHandle);
+    SafeCloseHandle(WriteHandle);
+
+    raise;
+  end;
+
+  ZeroMemory(@StartupInfo, SizeOf(TStartupInfo));
+  with StartupInfo do
+  begin
+    cb := SizeOf(StartupInfo);
+    dwFlags := STARTF_USESHOWWINDOW or STARTF_USESTDHANDLES;
+    wShowWindow := ShowWindowValues[FProcess.FShowWindow];
+    hStdInput := StdInReadPipe;
+    hStdOutput := WriteHandle;
+    hStdError :=  ErrorWriteHandle;
+  end;
+
+  // CurrentDir cannot point to an empty string;
+  if FProcess.FCurrentDir = '' then
+    PCurrentDir := nil
+  else
+    PCurrentDir := PChar(FProcess.FCurrentDir);
+
+  if FProcess.FEnvironment.Count = 0 then
+    EnvironmentData := nil
+  else
+    StringsToMultiSz(EnvironmentData, FProcess.FEnvironment);
+
+  Flags := CREATE_NEW_CONSOLE or CREATE_UNICODE_ENVIRONMENT or
+    ProcessPriorities[FProcess.FProcessPriority];
+
+  try
+    try
+      // Create the process
+      if not CreateProcess(nil, PChar(FProcess.FCommandline), nil, nil, True,
+        Flags, EnvironmentData, PCurrentDir, StartupInfo, FProcessInformation)
+      then
+        RaiseLastOSError;
+    finally
+      // Close handles no longer needed ASAP
+      SafeCloseHandle(WriteHandle);  // Has been duplicated by CreateProcess
+      SafeCloseHandle(ErrorWriteHandle);  // Has been duplicated by CreateProcess
+      SafeCloseHandle(StdInReadPipe); // Has been duplicated by CreateProcess
+    end;
+    CloseHandle(FProcessInformation.hThread); // Not needed
+
+    // Asynchronous read from stdout
+    ExtOverlapped.Process := FProcess;
+    SetLength(ExtOverlapped.Buffer, FProcess.FBufferSize);
+    ExtOverlapped.PipeHandle := @ReadHandle;
+    ExtOverlapped.OnReadProc := ReadOutput;
+    ZeroMemory(@ExtOverlapped.Overlapped, SizeOf(TOverlapped));
+
+    if not ReadFileEx(
+      ReadHandle,
+      @ExtOverlapped.Buffer[0],
+      FProcess.FBufferSize,
+      @ExtOverlapped.Overlapped,
+      @ReadCompletionRoutine)
+    then
+      RaiseLastOSError;
+
+    // Asynchronous read from stderror
+    ExtOverlappedError.Process := FProcess;
+    SetLength(ExtOverlappedError.Buffer, FProcess.FBufferSize);
+    ExtOverlappedError.PipeHandle := @ErrorReadHandle;
+    ExtOverlappedError.OnReadProc := ReadErrorOutput;
+    ZeroMemory(@ExtOverlappedError.Overlapped, SizeOf(TOverlapped));
+
+    if not ReadFileEx(
+      ErrorReadHandle,
+      @ExtOverlappedError.Buffer[0],
+      FProcess.FBufferSize,
+      @ExtOverlappedError.Overlapped,
+      @ReadCompletionRoutine)
+    then
+      RaiseLastOSError;
+
+    repeat
+      // Alertable wait so the that read completion interrupts the wait
+      case WaitForSingleObjectEx(FProcess.FWriteEvent.Handle, INFINITE, True) of
+        WAIT_OBJECT_0:
+          begin
+            // Write data to the server
+            FProcess.FWriteLock.Enter;
+            try
+              if not Terminated and (Length(FProcess.FWriteBytes) > 0) then
+              begin
+                if not WriteFile(StdInWritePipe, FProcess.FWriteBytes[0],
+                  Length(FProcess.FWriteBytes), BytesWritten, nil)
+                then
+                  Terminate;
+                FProcess.FWriteBytes := [];
+              end;
+            finally
+              FProcess.FWriteLock.Leave;
+            end;
+          end;
+          WAIT_IO_COMPLETION: Continue;
+        else
+          RaiseLastOSError;
+      end;
+    until Terminated or ((ReadHandle = 0) and (ErrorReadHandle = 0));
+
+    // Correct the length of output and error output
+    FProcess.FOutput :=  Copy(FOutputStream.Bytes, 0,  FOutputStream.Size);
+    FProcess.FErrorOutput :=
+      Copy(FErrorOutputStream.Bytes, 0,  FErrorOutputStream.Size);
+
+    // Close all remaining handles
+    GetExitCodeProcess(FProcessInformation.hProcess, FProcess.FExitCode);
+    SafeCloseHandle(FProcessInformation.hProcess);
+  finally
+    if EnvironmentData <> nil then
+      FreeMem(EnvironmentData);
+    SafeCloseHandle(StdInWritePipe);
+    SafeCloseHandle(ReadHandle);
+    SafeCloseHandle(ErrorReadHandle);
+  end;
+end;
+
+procedure TProcessThread.ReadErrorOutput(Bytes: TBytes);
+begin
+  if FProcess.FMergeError then
+    ReadOutput(Bytes)
+  else
+  begin
+    if Assigned(FProcess.FOnErrorRead) then
+      FProcess.FOnErrorRead(FProcess, Bytes)
+    else
+      FErrorOutputStream.Write(Bytes, Length(Bytes));
+  end;
+end;
+
+procedure TProcessThread.ReadOutput(Bytes: TBytes);
+begin
+  if Assigned(FProcess.FOnRead) then
+    FProcess.FOnRead(FProcess, Bytes)
+  else
+    FOutputStream.Write(Bytes, Length(Bytes));
+end;
+
+procedure TProcessThread.TerminatedSet;
+const
+  FORCED_TERMINATION = $FE;
+begin
+  // Kill the server when Terminate is called
+  if Started and not Finished and (FProcessInformation.hProcess <> 0) then
+    TerminateProcess(FProcessInformation.hProcess, FORCED_TERMINATION);
+  inherited;
+end;
+
+{$ENDREGION 'TProcessThread'}
+
+{$REGION 'TPProcess'}
+
+constructor TPProcess.Create(ACommandLine, ACurrentDir: string);
+begin
+  inherited Create;
+  FCommandLine := ACommandLine;
+  FCurrentDir := ACurrentDir;
+  // CreateProcess expects writable CommandLine and CurrentDir
+  UniqueString(FCommandLine);
+  UniqueString(FCurrentDir);
+
+  FBufferSize := $4000;
+  FShowWindow := swHide;
+  FProcessPriority := ppNormal;
+
+  FEnvironment := TStringList.Create;
+  FWriteLock.Initialize;
+  FWriteEvent := TSimpleEvent.Create(nil, False, False, '');
+end;
+
+destructor TPProcess.Destroy;
+begin
+  FEnvironment.Free;
+  FWriteLock.Free;
+  FWriteEvent.Free;
+  FExecThread.Free;
+  FException.Free;
+
+  inherited;
+end;
+
+procedure TPProcess.Execute;
+begin
+  FExecThread := TProcessThread.Create(Self);
+end;
+
+function TPProcess.GetBufferSize: Cardinal;
+begin
+  Result := FBufferSize;
+end;
+
+function TPProcess.GetCommandLine: string;
+begin
+  Result := FCommandLine;
+end;
+
+function TPProcess.GetCurrentDir: string;
+begin
+  Result := FCurrentDir;
+end;
+
+function TPProcess.GetEnvironment: TStrings;
+begin
+  Result := FEnvironment;
+end;
+
+function TPProcess.GetErrorOutput: TBytes;
+begin
+  Result := FErrorOutput;
+end;
+
+function TPProcess.GetException: PPException;
+begin
+  Result := FException;
+  FException := nil;
+end;
+
+function TPProcess.GetExitCode: Cardinal;
+begin
+  Result := FExitCode;
+end;
+
+function TPProcess.GetMergeError: Boolean;
+begin
+  Result := FMergeError;
+end;
+
+function TPProcess.GetOutput: TBytes;
+begin
+  Result := FOutput;
+end;
+
+function TPProcess.GetProcessPriority: TPProcessPriority;
+begin
+  Result := FProcessPriority
+end;
+
+function TPProcess.GetShowWindow: TPPShowWindow;
+begin
+  Result := FShowWindow;
+end;
+
+procedure TPProcess.SetBufferSize(const Value: Cardinal);
+begin
+  FBufferSize := Value;
+end;
+
+procedure TPProcess.SetCommandLine(const Value: string);
+begin
+  FCommandLine := Value;
+end;
+
+procedure TPProcess.SetCurrentDir(const Value: string);
+begin
+  FCurrentDir := Value;
+end;
+
+procedure TPProcess.SetEnvironment(const Value: TStrings);
+begin
+  FEnvironment.Assign(Value);
+end;
+
+procedure TPProcess.SetMergeError(const Value: Boolean);
+begin
+  FMergeError := Value;
+end;
+
+procedure TPProcess.SetOnErrorRead(const Value: TPPReadEvent);
+begin
+  FOnErrorRead := Value;
+end;
+
+procedure TPProcess.SetOnRead(const Value: TPPReadEvent);
+begin
+  FOnRead := Value;
+end;
+
+procedure TPProcess.SetOnTerminate(const Value: TNotifyEvent);
+begin
+  FOnTerminate := Value;
+end;
+
+procedure TPProcess.SetProcessPriority(const Value: TPProcessPriority);
+begin
+  FProcessPriority := Value;
+end;
+
+procedure TPProcess.SetShowWindow(const Value: TPPShowWindow);
+begin
+  FShowWindow := Value;
+end;
+
+procedure TPProcess.SyncExecute;
+var
+  Exception: PPException;
+begin
+  FExecThread := TProcessThread.Create(Self);
+  FExecThread.WaitFor;
+  Exception := GetException;
+  FreeAndNil(FExecThread);
+  if Exception is PPException then
+    raise Exception;
+end;
+
+procedure TPProcess.Terminate;
+begin
+  if Assigned(FExecThread) and FExecThread.Started
+    and not FExecThread.Finished
+  then
+    FExecThread.Terminate;
+end;
+
+procedure TPProcess.ThreadTerminate(Sender: TObject);
+begin
+  if FExecThread.FatalException is Exception then
+    FException :=
+      PPException.Create(Exception(FExecThread.FatalException).Message);
+
+  if Assigned(FOnTerminate) then
+    FOnTerminate(Sender);
+end;
+
+procedure TPProcess.WriteProcessInput(Bytes: TBytes);
+begin
+  FWriteLock.Enter;
+  try
+    FWriteBytes := FWriteBytes + Bytes;
+  finally
+    FWriteLock.Leave;
+  end;
+  FWriteEvent.SetEvent;
+end;
+
+{$ENDREGION 'TPProcess'}
+
+end.

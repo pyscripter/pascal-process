@@ -6,17 +6,17 @@ Pascal library for running processes and redirecting their output.
 There are other pascal components for running processess and redirect their output.   This library is the outcome of frustrations with most of those components:
 
 - Fixation with and premature conversion to strings.  Processes produce and consume bytes.
-- Blocking reading of process output, resulting to ineffeciences (tight loops with Sleep, or separate threads for reading the output or providing input to the process)
+- Blocking reading of process output, resulting to inefficiencies (tight loops with Sleep, or separate threads for reading the output or providing input to the process)
 - Incomplete features and/or over-bloated
 
 ## Features
 - Asynchronous reading of process output
-- Separate stdout and stderr reading which can optionally be mereged
-- Ability to process output as it is produced or else let it accumulate and read the final result
+- Separate stdout and stderr reading which can optionally be merged
+- Ability to consume output as it is produced or else let it accumulate and read the final result
 - Ability to provide input to the running process before or while the process is running.
-- Ability to ternminate the running process.
+- Ability to terminate the running process.
 - Synchronous and asynchronous execution of processes.
-- Interfaced based that facilitates memory management.
+- Interfaced-based facilitating memory management.
 
 ## Limitations
 Currently the library is Windows only.  The intention is to support other platforms (help wanted).  

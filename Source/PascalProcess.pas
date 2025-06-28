@@ -45,6 +45,10 @@ type
 
   TPPReadEvent = procedure(Sender: TObject; const Bytes: TBytes) of object;
 
+  {$SCOPEDENUMS ON}
+  TPPState = (Created, Running, Completed, Terminated, Exception);
+  {$SCOPEDENUMS OFF}
+
   IPProcess = interface
   ['{02CBC80B-CCF2-410C-96BE-C7EBE88BD8A4}']
     // property getters
@@ -59,6 +63,7 @@ type
     function GetMergeError: Boolean;
     function GetProcessPriority: TPProcessPriority;
     function GetShowWindow: TPPShowWindow;
+    function GetState: TPPState;
     // property setters
     procedure SetCommandLine(const Value: string);
     procedure SetCurrentDir(const Value: string);
@@ -83,10 +88,14 @@ type
     procedure Execute;
 
     /// <summary> Executes the process synchronously </summary>
+    /// <remarks> If an exception occures it raises it </remarks>
     procedure SyncExecute;
 
     /// <summary> Terminates the running process </summary>
     procedure Terminate;
+
+    /// <summary> Wait for the process to exit </summary>
+    procedure WaitFor;
 
     // Input properties
 
@@ -148,6 +157,9 @@ type
     property Exception: PPException read GetException;
     // Events
 
+    /// <summary> The process state (see TPPState) </summary>
+    property State: TPPState read GetState;
+
     /// <summary> Event triggered when output is received </summary>
     /// <remarks>
     ///   It is executed inside the process thread. If MergeError is True
@@ -186,6 +198,7 @@ type
     FWriteEvent: TSimpleEvent;
     FExecThread: TThread;
     FException: PPException;
+    FState: TPPState;
 
     FOnRead: TPPReadEvent;
     FOnErrorRead: TPPReadEvent;
@@ -203,6 +216,7 @@ type
     function GetMergeError: Boolean;
     function GetProcessPriority: TPProcessPriority;
     function GetShowWindow: TPPShowWindow;
+    function GetState: TPPState;
     // property setters
     procedure SetCommandLine(const Value: string);
     procedure SetCurrentDir(const Value: string);
@@ -215,17 +229,30 @@ type
     procedure SetOnErrorRead(const Value: TPPReadEvent);
     procedure SetOnTerminate(const Value: TNotifyEvent);
     // Procedures
-    procedure ThreadTerminate(Sender: TObject);
+    procedure ThreadTerminated(Sender: TObject);
     procedure WriteProcessInput(Bytes: TBytes);
-    procedure Execute;
+    procedure Execute; overload;
     procedure SyncExecute;
     procedure Terminate;
+    procedure WaitFor;
   public
-    constructor Create(ACommandLine: string; ACurrentDir: string = '');
+    constructor Create(const ACommandLine: string; const ACurrentDir: string = '');
     destructor Destroy; override;
+    class function Execute(const ACommandLine: string;
+      const ACurrentDir: string = ''): TBytes; overload;
+    class procedure Execute(const ACommandLine: string;
+      const ACurrentDir: string; out Output, ErrOutput: TBytes) overload;
   end;
 
+const
+  /// <summary> Exit code when the process is forcefully terminated </summary>
+  FORCED_TERMINATION = $FE;
+
 implementation
+
+uses
+  Winapi.TlHelp32,
+  System.Generics.Collections;
 
 resourcestring
   rsEmptyEnvString = 'Environment strings cannot be empty';
@@ -312,6 +339,67 @@ begin
   Result := True;
 end;
 
+
+function TerminateProcessTree(ProcessHandle: THandle; ProcessID: DWORD): Boolean;
+
+type
+  TProcessArray = TArray<DWORD>;
+
+  function GetChildProcesses(ParentID: DWORD): TProcessArray;
+  var
+    Snapshot: THandle;
+    Entry: PROCESSENTRY32;
+    ProcessList: TList<DWORD>;
+  begin
+    Result := [];
+    Snapshot := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+    if Snapshot = INVALID_HANDLE_VALUE then Exit;
+
+    try
+      Entry.dwSize := SizeOf(Entry);
+      if not Process32First(Snapshot, Entry) then Exit;
+
+      // Create ProcessList only after successful snapshot and first process enumeration
+      ProcessList := TList<DWORD>.Create;
+      try
+        // Collect direct child processes
+        repeat
+          if Entry.th32ParentProcessID = ParentID then
+            ProcessList.Add(Entry.th32ProcessID);
+        until not Process32Next(Snapshot, Entry);
+
+        Result := ProcessList.ToArray;
+      finally
+        ProcessList.Free;
+      end;
+    finally
+      CloseHandle(Snapshot);
+    end;
+  end;
+
+var
+  PIDs: TProcessArray;
+  I: Integer;
+  Handle: THandle;
+begin
+  Result := True;
+  PIDs := GetChildProcesses(ProcessID);
+  for I := High(PIDs) downto 0 do
+  begin
+    Handle := OpenProcess(PROCESS_TERMINATE, False, PIDs[I]);
+    if Handle <> 0 then
+    begin
+      Result := TerminateProcess(Handle, FORCED_TERMINATION) and Result;
+      CloseHandle(Handle);
+    end
+    else
+      Result := False;
+  end;
+  // Now terminate the parent process
+  Result := TerminateProcess(ProcessHandle, FORCED_TERMINATION) and Result;
+end;
+
 // From JclStrings
 function StringsToMultiSz(var Dest: PChar; const Source: TStrings): PChar;
 var
@@ -338,7 +426,6 @@ end;
 
 {$ENDREGION 'Support routines'}
 
-
 {$REGION 'TProcessThread'}
 type
   TProcessThread = class(TThread)
@@ -350,8 +437,9 @@ type
     procedure ReadOutput(Bytes: TBytes);
     procedure ReadErrorOutput(Bytes: TBytes);
   protected
-    procedure TerminatedSet; override;
+    procedure DoTerminate; override;
     procedure Execute; override;
+    procedure TerminatedSet; override;
   public
     constructor Create(Process: TPProcess);
     destructor Destroy; override;
@@ -366,7 +454,6 @@ begin
   FOutputStream := TBytesStream.Create([]);
   FErrorOutputStream := TBytesStream.Create([]);
 
-  OnTerminate := FProcess.ThreadTerminate;
   FreeOnTerminate := False;
 end;
 
@@ -416,6 +503,11 @@ begin
   FOutputStream.Free;
   FErrorOutputStream.Free;
   inherited;
+end;
+
+procedure TProcessThread.DoTerminate;
+begin
+  FProcess.ThreadTerminated(Self);
 end;
 
 procedure TProcessThread.Execute;
@@ -513,6 +605,8 @@ begin
     end;
     CloseHandle(FProcessInformation.hThread); // Not needed
 
+    FProcess.FState := TPPState.Running;
+
     // Asynchronous read from stdout
     ExtOverlapped.Process := FProcess;
     SetLength(ExtOverlapped.Buffer, FProcess.FBufferSize);
@@ -569,16 +663,20 @@ begin
         else
           RaiseLastOSError;
       end;
-    until Terminated or ((ReadHandle = 0) and (ErrorReadHandle = 0));
+    until (ReadHandle = 0) and (ErrorReadHandle = 0);
 
-    // Correct the length of output and error output
-    FProcess.FOutput :=  Copy(FOutputStream.Bytes, 0,  FOutputStream.Size);
-    FProcess.FErrorOutput :=
-      Copy(FErrorOutputStream.Bytes, 0,  FErrorOutputStream.Size);
-
-    // Close all remaining handles
+    // Wait for the process to terminate so that we get the correct exit code
+    WaitForSingleObject(FProcessInformation.hProcess, INFINITE);
     GetExitCodeProcess(FProcessInformation.hProcess, FProcess.FExitCode);
+    // Close process handle
     SafeCloseHandle(FProcessInformation.hProcess);
+
+    // Save the stdout and stderr ouput
+    if FOutputStream.Size > 0 then
+      FProcess.FOutput :=  Copy(FOutputStream.Bytes, 0,  FOutputStream.Size);
+    if FErrorOutputStream.Size > 0 then
+      FProcess.FErrorOutput :=
+        Copy(FErrorOutputStream.Bytes, 0,  FErrorOutputStream.Size);
   finally
     if EnvironmentData <> nil then
       FreeMem(EnvironmentData);
@@ -610,12 +708,10 @@ begin
 end;
 
 procedure TProcessThread.TerminatedSet;
-const
-  FORCED_TERMINATION = $FE;
 begin
   // Kill the server when Terminate is called
   if Started and not Finished and (FProcessInformation.hProcess <> 0) then
-    TerminateProcess(FProcessInformation.hProcess, FORCED_TERMINATION);
+    TerminateProcessTree(FProcessInformation.hProcess, FProcessInformation.dwProcessId);
   inherited;
 end;
 
@@ -623,7 +719,8 @@ end;
 
 {$REGION 'TPProcess'}
 
-constructor TPProcess.Create(ACommandLine, ACurrentDir: string);
+constructor TPProcess.Create(const ACommandLine: string; const ACurrentDir:
+    string = '');
 begin
   inherited Create;
   FCommandLine := ACommandLine;
@@ -650,6 +747,28 @@ begin
   FException.Free;
 
   inherited;
+end;
+
+class procedure TPProcess.Execute(const ACommandLine, ACurrentDir: string;
+  out Output, ErrOutput: TBytes);
+var
+  Process: IPProcess;
+begin
+  Process := TPProcess.Create(ACommandLine, ACurrentDir);
+  Process.SyncExecute;
+  Output := Process.Output;
+  ErrOutput := Process.ErrorOutput;
+end;
+
+class function TPProcess.Execute(const ACommandLine,
+  ACurrentDir: string): TBytes;
+var
+  Process: IPProcess;
+begin
+  Process := TPProcess.Create(ACommandLine, ACurrentDir);
+  Process.MergeError := True;
+  Process.SyncExecute;
+  Result := Process.Output;
 end;
 
 procedure TPProcess.Execute;
@@ -713,6 +832,11 @@ begin
   Result := FShowWindow;
 end;
 
+function TPProcess.GetState: TPPState;
+begin
+  Result := FState;
+end;
+
 procedure TPProcess.SetBufferSize(const Value: Cardinal);
 begin
   FBufferSize := Value;
@@ -769,10 +893,9 @@ var
 begin
   FExecThread := TProcessThread.Create(Self);
   FExecThread.WaitFor;
-  Exception := GetException;
   FreeAndNil(FExecThread);
-  if Exception is PPException then
-    raise Exception;
+  if FState = TPPState.Exception then
+    raise GetException;
 end;
 
 procedure TPProcess.Terminate;
@@ -783,14 +906,34 @@ begin
     FExecThread.Terminate;
 end;
 
-procedure TPProcess.ThreadTerminate(Sender: TObject);
+procedure TPProcess.ThreadTerminated(Sender: TObject);
 begin
   if FExecThread.FatalException is Exception then
+  begin
     FException :=
       PPException.Create(Exception(FExecThread.FatalException).Message);
+    FState := TPPState.Exception;
+  end
+  else
+  begin
+    if FExitCode = FORCED_TERMINATION then
+      FState := TPPState.Terminated
+    else
+      FState := TPPState.Completed;
+  end;
 
   if Assigned(FOnTerminate) then
-    FOnTerminate(Sender);
+    TThread.Synchronize(FExecThread,
+      procedure
+      begin
+        FOnTerminate(Sender);
+      end);
+end;
+
+procedure TPProcess.WaitFor;
+begin
+  if Assigned(FExecThread) then
+    FExecThread.WaitFor;
 end;
 
 procedure TPProcess.WriteProcessInput(Bytes: TBytes);

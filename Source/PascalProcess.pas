@@ -64,6 +64,7 @@ type
     function GetProcessPriority: TPProcessPriority;
     function GetShowWindow: TPPShowWindow;
     function GetState: TPPState;
+    function GetProcessId: Cardinal;
     // property setters
     procedure SetCommandLine(const Value: string);
     procedure SetCurrentDir(const Value: string);
@@ -160,6 +161,9 @@ type
     /// <summary> The process state (see TPPState) </summary>
     property State: TPPState read GetState;
 
+    /// <summary> The process state (see TPPState) </summary>
+    property ProcessID: Cardinal read GetProcessId;
+
     /// <summary> Event triggered when output is received </summary>
     /// <remarks>
     ///   It is executed inside the process thread. If MergeError is True
@@ -217,6 +221,7 @@ type
     function GetProcessPriority: TPProcessPriority;
     function GetShowWindow: TPPShowWindow;
     function GetState: TPPState;
+    function GetProcessId: Cardinal;
     // property setters
     procedure SetCommandLine(const Value: string);
     procedure SetCurrentDir(const Value: string);
@@ -820,6 +825,14 @@ end;
 function TPProcess.GetOutput: TBytes;
 begin
   Result := FOutput;
+end;
+
+function TPProcess.GetProcessId: Cardinal;
+begin
+  if Assigned(FExecThread) then
+    Result := TProcessThread(FExecThread).FProcessInformation.dwProcessId
+  else
+    Result := 0;
 end;
 
 function TPProcess.GetProcessPriority: TPProcessPriority;

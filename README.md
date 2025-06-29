@@ -115,7 +115,7 @@ type
     swShowNormal
   );
 
-  TPPReadEvent = procedure(Sender: TObject; const Bytes: TBytes) of object;
+  TPPReadEvent = procedure(Sender: TObject; const Bytes: TBytes; BytesRead: Cardinal) of object;
 
   {$SCOPEDENUMS ON}
   TPPState = (Created, Running, Completed, Terminated, Exception);

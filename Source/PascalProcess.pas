@@ -43,7 +43,7 @@ type
     swShowNormal
   );
 
-  TPPReadEvent = procedure(Sender: TObject; const Bytes: TBytes) of object;
+  TPPReadEvent = procedure(Sender: TObject; const Bytes: TBytes; BytesRead: Cardinal) of object;
 
   {$SCOPEDENUMS ON}
   TPPState = (Created, Running, Completed, Terminated, Exception);
@@ -439,8 +439,8 @@ type
     FProcessInformation: TProcessInformation;
     FOutputStream: TBytesStream;
     FErrorOutputStream: TBytesStream;
-    procedure ReadOutput(Bytes: TBytes);
-    procedure ReadErrorOutput(Bytes: TBytes);
+    procedure ReadOutput(const Bytes: TBytes; BytesRead: Cardinal);
+    procedure ReadErrorOutput(const Bytes: TBytes; BytesRead: Cardinal);
   protected
     procedure DoTerminate; override;
     procedure Execute; override;
@@ -463,7 +463,7 @@ begin
 end;
 
 type
-  TOnReadProc = procedure(Bytes: TBytes) of object;
+  TOnReadProc = procedure(const Bytes: TBytes; BytesRead: Cardinal) of object;
 
   PExtOverlapped = ^TExtOverlapped;
   TExtOverlapped = record
@@ -487,8 +487,8 @@ begin
 
   // Process received data
   if dwNumberOfBytesTransfered > 0 then
-    PExtOverlapped(lpOverlapped).OnReadProc(
-      Copy(PExtOverlapped(lpOverlapped).Buffer, 0, dwNumberOfBytesTransfered));
+    PExtOverlapped(lpOverlapped).OnReadProc(PExtOverlapped(lpOverlapped).Buffer,
+      dwNumberOfBytesTransfered);
 
   ZeroMemory(lpOverlapped, SizeOf(TOverlapped));
 
@@ -691,25 +691,25 @@ begin
   end;
 end;
 
-procedure TProcessThread.ReadErrorOutput(Bytes: TBytes);
+procedure TProcessThread.ReadErrorOutput(const Bytes: TBytes; BytesRead: Cardinal);
 begin
   if FProcess.FMergeError then
-    ReadOutput(Bytes)
+    ReadOutput(Bytes, BytesRead)
   else
   begin
     if Assigned(FProcess.FOnErrorRead) then
-      FProcess.FOnErrorRead(FProcess, Bytes)
+      FProcess.FOnErrorRead(FProcess, Bytes, BytesRead)
     else
-      FErrorOutputStream.Write(Bytes, Length(Bytes));
+      FErrorOutputStream.Write(Bytes, BytesRead);
   end;
 end;
 
-procedure TProcessThread.ReadOutput(Bytes: TBytes);
+procedure TProcessThread.ReadOutput(const Bytes: TBytes; BytesRead: Cardinal);
 begin
   if Assigned(FProcess.FOnRead) then
-    FProcess.FOnRead(FProcess, Bytes)
+    FProcess.FOnRead(FProcess, Bytes, BytesRead)
   else
-    FOutputStream.Write(Bytes, Length(Bytes));
+    FOutputStream.Write(Bytes, BytesRead);
 end;
 
 procedure TProcessThread.TerminatedSet;

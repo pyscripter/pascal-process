@@ -451,8 +451,8 @@ begin
   inherited Create(False);
   FProcess := Process;
 
-  FOutputStream := TBytesStream.Create([]);
-  FErrorOutputStream := TBytesStream.Create([]);
+  FOutputStream := TBytesStream.Create;
+  FErrorOutputStream := TBytesStream.Create;
 
   FreeOnTerminate := False;
 end;
@@ -603,7 +603,7 @@ begin
       SafeCloseHandle(ErrorWriteHandle);  // Has been duplicated by CreateProcess
       SafeCloseHandle(StdInReadPipe); // Has been duplicated by CreateProcess
     end;
-    CloseHandle(FProcessInformation.hThread); // Not needed
+    SafeCloseHandle(FProcessInformation.hThread); // Not needed
 
     FProcess.FState := TPPState.Running;
 
@@ -652,7 +652,7 @@ begin
                 if not WriteFile(StdInWritePipe, FProcess.FWriteBytes[0],
                   Length(FProcess.FWriteBytes), BytesWritten, nil)
                 then
-                  Terminate;
+                  RaiseLastOSError;
                 FProcess.FWriteBytes := [];
               end;
             finally
@@ -668,18 +668,18 @@ begin
     // Wait for the process to terminate so that we get the correct exit code
     WaitForSingleObject(FProcessInformation.hProcess, INFINITE);
     GetExitCodeProcess(FProcessInformation.hProcess, FProcess.FExitCode);
-    // Close process handle
-    SafeCloseHandle(FProcessInformation.hProcess);
-
+  finally
     // Save the stdout and stderr ouput
     if FOutputStream.Size > 0 then
       FProcess.FOutput :=  Copy(FOutputStream.Bytes, 0,  FOutputStream.Size);
     if FErrorOutputStream.Size > 0 then
       FProcess.FErrorOutput :=
         Copy(FErrorOutputStream.Bytes, 0,  FErrorOutputStream.Size);
-  finally
+
     if EnvironmentData <> nil then
       FreeMem(EnvironmentData);
+    // Close process and other handles
+    SafeCloseHandle(FProcessInformation.hProcess);
     SafeCloseHandle(StdInWritePipe);
     SafeCloseHandle(ReadHandle);
     SafeCloseHandle(ErrorReadHandle);

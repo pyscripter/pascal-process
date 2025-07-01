@@ -901,8 +901,6 @@ begin
 end;
 
 procedure TPProcess.SyncExecute;
-var
-  Exception: PPException;
 begin
   FExecThread := TProcessThread.Create(Self);
   FExecThread.WaitFor;

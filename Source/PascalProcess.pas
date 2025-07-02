@@ -558,6 +558,8 @@ var
   InpLen: Cardinal;
   CloseStdIn: Boolean;
 begin
+  NameThreadForDebugging('TProcessThread');
+
   SecurityAttributes.nLength := sizeof(SECURITY_ATTRIBUTES);
   SecurityAttributes.lpSecurityDescriptor := nil;
   SecurityAttributes.bInheritHandle := True;

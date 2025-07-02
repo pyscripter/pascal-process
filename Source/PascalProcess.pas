@@ -1,6 +1,7 @@
 {-----------------------------------------------------------------------------
  Unit Name: PascalProcess
  Author:    PyScripter (https://github.com/pyscripter)
+ Purpose:   Run a process and redirect (capture) its ouput
  License:   MIT
 -----------------------------------------------------------------------------}
 
@@ -33,6 +34,7 @@ type
   /// See https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow
   /// </summary>
   TPPShowWindow = (
+    swNotSet,
     swHide,
     swMaximize,
     swMinimize,
@@ -42,6 +44,9 @@ type
     swShowNA,
     swShowNormal
   );
+
+  /// <summary> Controls the base creation flag for CreateProcess </summary>
+  TPPCreationFlag = (cfNoWindow, cfNewConsole);
 
   TPPReadEvent = procedure(Sender: TObject; const Bytes: TBytes; BytesRead: Cardinal) of object;
 
@@ -57,6 +62,7 @@ type
     function GetOutput: TBytes;
     function GetErrorOutput: TBytes;
     function GetCommandLine: string;
+    function GetCreationFlag: TPPCreationFlag;
     function GetCurrentDir: string;
     function GetBufferSize: Cardinal;
     function GetEnvironment: TStrings;
@@ -67,6 +73,7 @@ type
     function GetProcessId: Cardinal;
     // property setters
     procedure SetCommandLine(const Value: string);
+    procedure SetCreationFlag(const Value: TPPCreationFlag);
     procedure SetCurrentDir(const Value: string);
     procedure SetBufferSize(const Value: Cardinal);
     procedure SetEnvironment(const Value: TStrings);
@@ -142,6 +149,15 @@ type
     /// </summary>
     property ShowWindow: TPPShowWindow read GetShowWindow write SetShowWindow;
 
+    /// <summary> The base creation flag for CreateProcess </summary>
+    /// <remarks>
+    ///   In most cases wsNotSet combined with cfNoWindow would work well.
+    ///   The base creation flag will be combined with the priority flag
+    ///   and CREATE_UNICODE_ENVIRONMENT.
+    /// </remarks>
+    property CreationFlag: TPPCreationFlag read GetCreationFlag
+      write SetCreationFlag;
+
     // Output properties
 
     /// <summary> The process exit code </summary>
@@ -201,6 +217,7 @@ type
     FOutput: TBytes;
     FErrorOutput: TBytes;
     FCommandLine: string;
+    FCreationFlag: TPPCreationFlag;
     FCurrentDir: string;
     FBufferSize: Cardinal;
     FEnvironment: TStrings;
@@ -224,6 +241,7 @@ type
     function GetOutput: TBytes;
     function GetErrorOutput: TBytes;
     function GetCommandLine: string;
+    function GetCreationFlag: TPPCreationFlag;
     function GetCurrentDir: string;
     function GetBufferSize: Cardinal;
     function GetEnvironment: TStrings;
@@ -234,6 +252,7 @@ type
     function GetProcessId: Cardinal;
     // property setters
     procedure SetCommandLine(const Value: string);
+    procedure SetCreationFlag(const Value: TPPCreationFlag);
     procedure SetCurrentDir(const Value: string);
     procedure SetBufferSize(const Value: Cardinal);
     procedure SetEnvironment(const Value: TStrings);
@@ -538,12 +557,14 @@ end;
 procedure TProcessThread.Execute;
 const
   ShowWindowValues: array [TPPShowWindow] of DWORD =
-    (SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWMINIMIZED,
+    (0, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWMINIMIZED,
      SW_SHOWMINNOACTIVE, SW_SHOWNA, SW_SHOWNORMAL);
   ProcessPriorities: array [TPProcessPriority] of DWORD =
     (IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
      REALTIME_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
      ABOVE_NORMAL_PRIORITY_CLASS);
+  CreationFlags: array [TPPCreationFlag] of DWORD =
+    (CREATE_NO_WINDOW, CREATE_NEW_CONSOLE);
 var
   StartupInfo: TStartupInfo;
   SecurityAttributes: TSecurityAttributes;
@@ -601,8 +622,12 @@ begin
   with StartupInfo do
   begin
     cb := SizeOf(StartupInfo);
-    dwFlags := STARTF_USESHOWWINDOW or STARTF_USESTDHANDLES;
-    wShowWindow := ShowWindowValues[FProcess.FShowWindow];
+    dwFlags := STARTF_USESTDHANDLES;
+    if FProcess.FShowWindow <> swNotSet then
+    begin
+      dwFlags := STARTF_USESHOWWINDOW or dwFlags;
+      wShowWindow := ShowWindowValues[FProcess.FShowWindow];
+    end;
     hStdInput := StdInReadPipe;
     hStdOutput := WriteHandle;
     hStdError :=  ErrorWriteHandle;
@@ -619,8 +644,8 @@ begin
   else
     StringsToMultiSz(EnvironmentData, FProcess.FEnvironment);
 
-  Flags := CREATE_NEW_CONSOLE or CREATE_UNICODE_ENVIRONMENT or
-    ProcessPriorities[FProcess.FProcessPriority];
+  Flags := CreationFlags[FProcess.FCreationFlag] or
+    ProcessPriorities[FProcess.FProcessPriority] or CREATE_UNICODE_ENVIRONMENT;
 
   try
     try
@@ -690,7 +715,10 @@ begin
                   WriteFile(StdInWritePipe, FProcess.FWriteBytes[0], InpLen,
                   BytesWritten, nil)
                 then
+                begin
+                  SafeCloseHandle(StdInWritePipe);
                   RaiseLastOSError;
+                end;
                 FProcess.FWriteBytes := [];
 
                 if CloseStdIn then
@@ -836,6 +864,11 @@ begin
   Result := FCommandLine;
 end;
 
+function TPProcess.GetCreationFlag: TPPCreationFlag;
+begin
+  Result := FCreationFlag;
+end;
+
 function TPProcess.GetCurrentDir: string;
 begin
   Result := FCurrentDir;
@@ -903,6 +936,11 @@ end;
 procedure TPProcess.SetCommandLine(const Value: string);
 begin
   FCommandLine := Value;
+end;
+
+procedure TPProcess.SetCreationFlag(const Value: TPPCreationFlag);
+begin
+  FCreationFlag := Value;
 end;
 
 procedure TPProcess.SetCurrentDir(const Value: string);

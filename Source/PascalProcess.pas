@@ -79,11 +79,11 @@ type
 
     // Procedures
 
-    /// <summary> Writes the Bytes to the stdin of the process </summary>
-    /// <remarks>
-    ///   Can be used before or during the execution of the process
-    /// </remarks>
-    procedure WriteProcessInput(Bytes: TBytes);
+    /// <summary>
+    ///   Closes the stdin handle, signalling the end of input
+    ///   Useful when the process executes in pipe mode.
+    /// </summary>
+    procedure CloseStdInHandle;
 
     /// <summary> Executes the process asynchronously </summary>
     procedure Execute;
@@ -96,7 +96,17 @@ type
     procedure Terminate;
 
     /// <summary> Wait for the process to exit </summary>
-    procedure WaitFor;
+    /// <param name="Timeout">
+    ///   Optional argument. Wait up to Timeout milliseconds
+    /// </param>
+    /// <returns> True if the process finishes within the Timeout </returns>
+    function WaitFor(Timeout: Cardinal = INFINITE): Boolean;
+
+    /// <summary> Writes the Bytes to the stdin of the process </summary>
+    /// <remarks>
+    ///   Can be used before or during the execution of the process
+    /// </remarks>
+    procedure WriteProcessInput(Bytes: TBytes);
 
     // Input properties
 
@@ -234,19 +244,28 @@ type
     procedure SetOnErrorRead(const Value: TPPReadEvent);
     procedure SetOnTerminate(const Value: TNotifyEvent);
     // Procedures
-    procedure ThreadTerminated(Sender: TObject);
-    procedure WriteProcessInput(Bytes: TBytes);
+    procedure CloseStdInHandle;
     procedure Execute; overload;
     procedure SyncExecute;
+    procedure ThreadTerminated(Sender: TObject);
+    procedure WriteProcessInput(Bytes: TBytes);
     procedure Terminate;
-    procedure WaitFor;
+    function WaitFor(Timeout: Cardinal = INFINITE): Boolean;
   public
     constructor Create(const ACommandLine: string; const ACurrentDir: string = '');
     destructor Destroy; override;
+    /// <summary>
+    ///   Executes ACommandLine and returns the output.
+    ///   stderr is merged with stdout.
+    /// </summary>
     class function Execute(const ACommandLine: string;
       const ACurrentDir: string = ''): TBytes; overload;
-    class procedure Execute(const ACommandLine: string;
-      const ACurrentDir: string; out Output, ErrOutput: TBytes) overload;
+    /// <summary> Executes ACommandLine. </summary>
+    /// <param name="Ouput"> On exit contains the process output </param>
+    /// <param name="ErrOuput"> On exit contains the process stderr output </param>
+    /// <returns> The process Exit code </returns>
+    class function Execute(const ACommandLine: string; const ACurrentDir: string;
+      out Output, ErrOutput: TBytes): Integer overload;
   end;
 
 const
@@ -261,6 +280,7 @@ uses
 
 resourcestring
   rsEmptyEnvString = 'Environment strings cannot be empty';
+  SWaitFor = 'WaitFor called before calling Execute';
 
 {$REGION 'Support routines'}
 
@@ -535,6 +555,8 @@ var
   PCurrentDir: PChar;
   EnvironmentData: PChar;
   Flags: DWORD;
+  InpLen: Cardinal;
+  CloseStdIn: Boolean;
 begin
   SecurityAttributes.nLength := sizeof(SECURITY_ATTRIBUTES);
   SecurityAttributes.lpSecurityDescriptor := nil;
@@ -548,10 +570,14 @@ begin
     if not SafeCreatePipe(StdInReadPipe, StdInWriteTmpPipe, @SecurityAttributes, 0) then
       RaiseLastOSError;
 
-    if not SafeDuplicateHandle(GetCurrentProcess, StdInWriteTmpPipe, GetCurrentProcess,
-      @StdInWritePipe, 0, False, DUPLICATE_SAME_ACCESS)
-    then
-      RaiseLastOSError;
+    try
+      if not SafeDuplicateHandle(GetCurrentProcess, StdInWriteTmpPipe,
+        GetCurrentProcess, @StdInWritePipe, 0, False, DUPLICATE_SAME_ACCESS)
+      then
+        RaiseLastOSError;
+    finally
+      SafeCloseHandle(StdInWriteTmpPipe);
+    end;
 
     // Create async pipe for reading stdout
     if not CreateAsyncPipe(ReadHandle, WriteHandle, @SecurityAttributes, FProcess.FBufferSize) then
@@ -562,7 +588,6 @@ begin
       RaiseLastOSError;
   except
     SafeCloseHandle(StdInReadPipe);
-    SafeCloseHandle(StdInWriteTmpPipe);
     SafeCloseHandle(StdInWritePipe);
     SafeCloseHandle(ReadHandle);
     SafeCloseHandle(WriteHandle);
@@ -610,8 +635,6 @@ begin
     end;
     SafeCloseHandle(FProcessInformation.hThread); // Not needed
 
-    FProcess.FState := TPPState.Running;
-
     // Asynchronous read from stdout
     ExtOverlapped.Process := FProcess;
     SetLength(ExtOverlapped.Buffer, FProcess.FBufferSize);
@@ -644,6 +667,8 @@ begin
     then
       RaiseLastOSError;
 
+    FProcess.FState := TPPState.Running;
+
     repeat
       // Alertable wait so the that read completion interrupts the wait
       case WaitForSingleObjectEx(FProcess.FWriteEvent.Handle, INFINITE, True) of
@@ -654,11 +679,22 @@ begin
             try
               if not Terminated and (Length(FProcess.FWriteBytes) > 0) then
               begin
-                if not WriteFile(StdInWritePipe, FProcess.FWriteBytes[0],
-                  Length(FProcess.FWriteBytes), BytesWritten, nil)
+                InpLen := Length(FProcess.FWriteBytes);
+                CloseStdIn := FProcess.FWriteBytes[InpLen - 1] = $04 {EOT};
+                if CloseStdIn then
+                  Dec(InpLen);
+
+                if (InpLen > 0) and not
+                  WriteFile(StdInWritePipe, FProcess.FWriteBytes[0], InpLen,
+                  BytesWritten, nil)
                 then
                   RaiseLastOSError;
                 FProcess.FWriteBytes := [];
+
+                if CloseStdIn then
+                begin
+                  SafeCloseHandle(StdInWritePipe);
+                end;
               end;
             finally
               FProcess.FWriteLock.Leave;
@@ -724,6 +760,12 @@ end;
 
 {$REGION 'TPProcess'}
 
+procedure TPProcess.CloseStdInHandle;
+// Signal EOT - The Execute method will detect it and close the stdin hadnle
+begin
+  WriteProcessInput([$04]); // EOT character
+end;
+
 constructor TPProcess.Create(const ACommandLine: string; const ACurrentDir:
     string = '');
 begin
@@ -754,8 +796,8 @@ begin
   inherited;
 end;
 
-class procedure TPProcess.Execute(const ACommandLine, ACurrentDir: string;
-  out Output, ErrOutput: TBytes);
+class function TPProcess.Execute(const ACommandLine: string; const ACurrentDir:
+    string; out Output, ErrOutput: TBytes): Integer;
 var
   Process: IPProcess;
 begin
@@ -763,6 +805,7 @@ begin
   Process.SyncExecute;
   Output := Process.Output;
   ErrOutput := Process.ErrorOutput;
+  Result := Process.ExitCode;
 end;
 
 class function TPProcess.Execute(const ACommandLine,
@@ -941,10 +984,26 @@ begin
       end);
 end;
 
-procedure TPProcess.WaitFor;
+function TPProcess.WaitFor(Timeout: Cardinal = INFINITE): Boolean;
 begin
-  if Assigned(FExecThread) then
-    FExecThread.WaitFor;
+  if not Assigned(FExecThread) then
+    raise PPException.CreateRes(@SWaitFor);
+
+  while FState = TPPState.Created do
+    TThread.Yield;
+
+  if (FState = TPPState.Running) and
+    (TProcessThread(FExecThread).FProcessInformation.hProcess <> 0) then
+  begin
+    Result :=
+      WaitForSingleObject(TProcessThread(FExecThread).FProcessInformation.hProcess,
+      Timeout) = WAIT_OBJECT_0;
+    if Result then
+      // Wait also for the thread to exit
+      FExecThread.WaitFor;
+  end
+  else
+    Result := True;
 end;
 
 procedure TPProcess.WriteProcessInput(Bytes: TBytes);

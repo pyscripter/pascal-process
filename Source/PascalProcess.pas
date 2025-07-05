@@ -8,6 +8,7 @@
 unit PascalProcess;
 
 interface
+
 uses
   Winapi.Windows,
   System.SysUtils,
@@ -915,7 +916,7 @@ end;
 
 function TPProcess.GetProcessPriority: TPProcessPriority;
 begin
-  Result := FProcessPriority
+  Result := FProcessPriority;
 end;
 
 function TPProcess.GetShowWindow: TPPShowWindow;

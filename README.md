@@ -54,14 +54,14 @@ Example:
 ```pascal
 type
   TUtils = class
-    class procedure OnRead(Sender: TObject; const Bytes: TBytes);
+    class procedure OnRead(Sender: TObject; const Bytes: TBytes; BytesRead: Cardinal);
   end;
 
 { TUtils }
 
-class procedure TUtils.OnRead(Sender: TObject; const Bytes: TBytes);
+class procedure TUtils.OnRead(Sender: TObject; const Bytes: TBytes;  BytesRead: Cardinal);
 begin
-  Writeln(TEncoding.ANSI.GetString(Bytes));
+  Writeln(TEncoding.ANSI.GetString(Bytes, 0, BytesRead));
 end;
 
 procedure Test2;

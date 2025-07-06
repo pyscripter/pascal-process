@@ -19,7 +19,7 @@ begin
   {$ELSE}
   Output := TPProcess.Execute('echo Hi Ubuntu');
   {$ENDIF}
-  Writeln(TEncoding.ANSI.GetString(Output));
+  Writeln(TEncoding.Default.GetString(Output));
 end;
 
 type
@@ -33,7 +33,7 @@ type
 class procedure TUtils.OnRead(Sender: TObject; const Bytes: TBytes;
   BytesRead: Cardinal);
 begin
-  Writeln(TEncoding.ANSI.GetString(Bytes, 0, BytesRead));
+  Writeln(TEncoding.Default.GetString(Bytes, 0, BytesRead));
 end;
 
 procedure Test2;

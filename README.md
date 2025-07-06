@@ -43,7 +43,7 @@ var
   Output: TBytes;
 begin
   Output := TPProcess.Execute('cmd /c echo Hi');
-  Writeln(TEncoding.ANSI.GetString(Output));
+  Writeln(TEncoding.Default.GetString(Output));
 end;
 ```
 
@@ -61,7 +61,7 @@ type
 
 class procedure TUtils.OnRead(Sender: TObject; const Bytes: TBytes;  BytesRead: Cardinal);
 begin
-  Writeln(TEncoding.ANSI.GetString(Bytes, 0, BytesRead));
+  Writeln(TEncoding.Default.GetString(Bytes, 0, BytesRead));
 end;
 
 procedure Test2;

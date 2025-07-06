@@ -10,7 +10,6 @@ unit PascalProcess;
 interface
 
 uses
-  Winapi.Windows,
   System.SysUtils,
   System.SyncObjs,
   System.Classes;
@@ -99,6 +98,11 @@ type
     /// <summary> Executes the process synchronously </summary>
     /// <remarks> If an exception occures it raises it </remarks>
     procedure SyncExecute;
+
+    /// <summary>
+    ///   Raises a keyboard interrupt in the running process
+    /// </summary>
+    procedure RaiseKeyboardInterrupt;
 
     /// <summary> Terminates the running process </summary>
     procedure Terminate;
@@ -226,7 +230,7 @@ type
     FProcessPriority: TPProcessPriority;
     FShowWindow: TPPShowWindow;
     FWriteBytes: TBytes;
-    FWriteLock: TRTLCriticalSection;
+    FWriteLock: TCriticalSection;
     FWriteEvent: TSimpleEvent;
     FExecThread: TThread;
     FException: PPException;
@@ -269,6 +273,7 @@ type
     procedure SyncExecute;
     procedure ThreadTerminated(Sender: TObject);
     procedure WriteProcessInput(Bytes: TBytes);
+    procedure RaiseKeyboardInterrupt;
     procedure Terminate;
     function WaitFor(Timeout: Cardinal = INFINITE): Boolean;
   public
@@ -295,7 +300,22 @@ const
 implementation
 
 uses
+  {$IFDEF MSWINDOWS}
+  Winapi.Windows,
   Winapi.TlHelp32,
+  {$ELSE}
+  System.Math,
+  System.DateUtils,
+  Posix.SysTypes,
+  Posix.Fcntl,
+  Posix.Unistd,
+  Posix.Signal,
+  Posix.Stdlib,
+  Posix.Errno,
+  Posix.SysSelect,
+  Posix.SysTime,
+  Posix.SysWait,
+  {$ENDIF}
   System.Generics.Collections;
 
 resourcestring
@@ -303,6 +323,10 @@ resourcestring
   SWaitFor = 'WaitFor called before calling Execute';
 
 {$REGION 'Support routines'}
+
+
+{$IFDEF MSWINDOWS}
+// Windows-specific helper functions
 
 // Closes handle if valid and ensures it becomes zero
 procedure SafeCloseHandle(var Handle: THandle);
@@ -469,14 +493,136 @@ begin
   Result := Dest;
 end;
 
-{$ENDREGION 'Support routines'}
+{$ELSE}
+
+procedure SafeCloseHandle(var Handle: Integer);
+begin
+  if Handle <> -1 then
+  begin
+    __close(Handle);
+    Handle := -1;
+  end;
+end;
+
+function CreatePipe(var ReadPipe, WritePipe: Integer): Boolean;
+var
+  PipeFD: array[0..1] of Integer;
+begin
+  Result := pipe(@PipeFD[0]) = 0;
+  if Result then
+  begin
+    ReadPipe := PipeFD[0];
+    WritePipe := PipeFD[1];
+  end
+  else
+  begin
+    ReadPipe := -1;
+    WritePipe := -1;
+  end;
+end;
+
+function StringsToEnvp(Strings: TStrings): PPAnsiChar;
+var
+  I: Integer;
+  Bytes: TBytes;
+  Envp: PPAnsiChar;
+begin
+  GetMem(Envp, (Strings.Count + 1) * SizeOf(PAnsiChar));
+  {$POINTERMATH ON}
+  for I := 0 to Strings.Count - 1 do
+  begin
+    Bytes := TEncoding.UTF8.GetBytes(Strings[I]);
+    GetMem(Envp[I], Length(Bytes) + 1); // +1 for null terminator
+    Move(Bytes[0], Envp[I]^, Length(Bytes));
+    Envp[I][Length(Bytes)] := #0; // null-terminate
+  end;
+
+  Envp[Strings.Count] := nil; // null-terminate the array
+  {$POINTERMATH OFF}
+
+  Result := Envp;
+end;
+
+
+procedure FreeEnvp(Envp: PPAnsiChar; Count: Integer);
+var
+  I: Integer;
+begin
+  for I := 0 to Count - 1 do
+    {$POINTERMATH ON}
+    FreeMem(Envp[I]);
+    {$POINTERMATH OFF}
+  FreeMem(Envp);
+end;
+
+function ShellSplitCommandLine(const Cmd: string): TArray<string>;
+var
+  Arg: string;
+  InQuotes: Boolean;
+  QuoteChar: Char;
+  I: Integer;
+  C: Char;
+
+  function NextChar: Char;
+  begin
+    if I < Length(Cmd) then
+      Result := Cmd[I + 1]
+    else
+      Result := #0;
+  end;
+
+begin
+  Result := [];
+  Arg := '';
+  InQuotes := False;
+  QuoteChar := #0;
+  I := 1;
+  while I <= Length(Cmd) do
+  begin
+    C := Cmd[I];
+    if not InQuotes and CharInSet(C, ['"', '''']) then
+    begin
+      InQuotes := True;
+      QuoteChar := C;
+    end
+    else if InQuotes and (C = QuoteChar) then
+    begin
+      InQuotes := False;
+      QuoteChar := #0;
+    end
+    else if (C = '\') and (I < Length(Cmd)) then
+    begin
+      Inc(I);
+      Arg := Arg + Cmd[I];
+    end
+    else if not InQuotes and (C = ' ') then
+    begin
+      if Arg <> '' then
+      begin
+        Result := Result + [Arg];
+        Arg := '';
+      end;
+    end
+    else
+      Arg := Arg + C;
+    Inc(I);
+  end;
+  if Arg <> '' then
+    Result := Result + [Arg];
+end;
+
+{$ENDIF}
 
 {$REGION 'TProcessThread'}
 type
   TProcessThread = class(TThread)
   private
     FProcess: TPProcess;
+    {$IFDEF MSWINDOWS}
     FProcessInformation: TProcessInformation;
+    {$ELSE}
+    FProcessID: pid_t;
+    {$ENDIF}
     FOutputStream: TBytesStream;
     FErrorOutputStream: TBytesStream;
     procedure ReadOutput(const Bytes: TBytes; BytesRead: Cardinal);
@@ -488,6 +634,7 @@ type
   public
     constructor Create(Process: TPProcess);
     destructor Destroy; override;
+    procedure RaiseKeyboardInterrupt;
   end;
 
 
@@ -502,6 +649,7 @@ begin
   FreeOnTerminate := False;
 end;
 
+{$IFDEF MSWINDOWS}
 type
   TOnReadProc = procedure(const Bytes: TBytes; BytesRead: Cardinal) of object;
 
@@ -542,6 +690,7 @@ begin
   then
     SafeCloseHandle(PExtOverlapped(lpOverlapped).PipeHandle^);
 end;
+{$ENDIF}
 
 destructor TProcessThread.Destroy;
 begin
@@ -556,6 +705,7 @@ begin
 end;
 
 procedure TProcessThread.Execute;
+{$IFDEF MSWINDOWS}
 const
   ShowWindowValues: array [TPPShowWindow] of DWORD =
     (0, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWMINIMIZED,
@@ -757,6 +907,206 @@ begin
     SafeCloseHandle(ErrorReadHandle);
   end;
 end;
+{$ELSE}
+var
+  StdInPipe, StdOutPipe, StdErrPipe: array[0..1] of Integer;
+  StdInWrite, StdOutRead, StdErrRead: Integer;
+  Args: TArray<string>;
+  Argv: PPAnsiChar;
+  I: Integer;
+  Env: PPAnsiChar;
+  M: TMarshaller;
+  Buffer: TBytes;
+  FDSet: fd_set;
+  Timeout: timeval;
+  BytesRead: ssize_t;
+  InpLen: Cardinal;
+  CloseStdIn: Boolean;
+  Status: Integer;
+  MaxFD: Integer;
+begin
+  NameThreadForDebugging('TProcessThread');
+  FProcess.FState := TPPState.Running;
+
+  // Parse command line
+  Args := ShellSplitCommandLine(FProcess.FCommandLine);
+  GetMem(Argv, (Length(Args) + 1) * SizeOf(PAnsiChar));
+  try
+    {$POINTERMATH ON}
+    for I := 0 to Length(Args) - 1 do
+      Argv[I] := M.AsAnsi(Args[I], TEncoding.UTF8.CodePage).ToPointer;
+    Argv[Length(Args)] := nil;
+    {$POINTERMATH OFF}
+
+    // Create pipes
+    if not CreatePipe(StdInPipe[0], StdInPipe[1]) or
+       not CreatePipe(StdOutPipe[0], StdOutPipe[1]) or
+       not CreatePipe(StdErrPipe[0], StdErrPipe[1])
+    then
+      raise PPException.Create('Pipe creation failed');
+
+    FProcessID := fork;
+    if FProcessID = 0 then // Child process
+    begin
+      dup2(StdInPipe[0], STDIN_FILENO);
+      dup2(StdOutPipe[1], STDOUT_FILENO);
+      dup2(StdErrPipe[1], STDERR_FILENO);
+
+      // Close unused pipe ends
+      __close(StdInPipe[1]);
+      __close(StdOutPipe[0]);
+      __close(StdErrPipe[0]);
+
+      if FProcess.FCurrentDir <> '' then
+        __chdir(M.AsAnsi(FProcess.FCurrentDir, TEncoding.UTF8.CodePage).ToPointer);
+
+      {$POINTERMATH ON}
+      if FProcess.FEnvironment.Count > 0 then
+      begin
+        Env := StringsToEnvp(FProcess.FEnvironment);
+        execve(Argv[0], Argv, Env);
+        FreeEnvp(Env, FProcess.FEnvironment.Count);
+      end
+      else
+        execvp(Argv[0], Argv);
+      {$POINTERMATH OFF}
+
+      _exit(errno); // If exec fails
+    end
+    else if FProcessID > 0 then // Parent process
+    begin
+      // Parent keeps write end of stdin, read end of stdout/stderr
+      StdInWrite := StdInPipe[1];
+      StdOutRead := StdOutPipe[0];
+      StdErrRead := StdErrPipe[0];
+      // Close unused ends
+      __close(StdInPipe[0]);
+      __close(StdOutPipe[1]);
+      __close(StdErrPipe[1]);
+      // Set non-blocking
+      fcntl(StdOutRead, F_SETFL, O_NONBLOCK);
+      if (StdErrRead <> -1) then
+        fcntl(StdErrRead, F_SETFL, O_NONBLOCK);
+    end
+    else
+      raise PPException.Create('fork failed');
+  finally
+    FreeMem(Argv);
+  end;
+
+  // Now the rest of your read/write loop as before...
+  SetLength(Buffer, FProcess.FBufferSize);
+  repeat
+    __FD_ZERO(FDSet);
+    MaxFD := -1;
+    if StdOutRead <> -1 then
+    begin
+      __FD_SET(StdOutRead, FDSet);
+      if StdOutRead > MaxFD then MaxFD := StdOutRead;
+    end;
+    if StdErrRead <> -1 then
+    begin
+      __FD_SET(StdErrRead, FDSet);
+      if StdErrRead > MaxFD then MaxFD := StdErrRead;
+    end;
+    Timeout.tv_sec := 0;
+    Timeout.tv_usec := 100000; // 100ms
+    if (MaxFD >= 0) and (select(MaxFD + 1, @FDSet, nil, nil, @Timeout) > 0) then
+    begin
+      if (StdOutRead <> -1) and FD_ISSET(StdOutRead, FDSet) then
+      begin
+        BytesRead := __read(StdOutRead, @Buffer[0], FProcess.FBufferSize);
+        if BytesRead > 0 then
+          ReadOutput(Buffer, BytesRead)
+        else if BytesRead = 0 then
+        begin
+          SafeCloseHandle(StdOutRead);
+          StdOutRead := -1;
+        end;
+      end;
+      if (StdErrRead <> -1) and FD_ISSET(StdErrRead, FDSet) then
+      begin
+        BytesRead := __read(StdErrRead, @Buffer[0], FProcess.FBufferSize);
+        if BytesRead > 0 then
+          ReadErrorOutput(Buffer, BytesRead)
+        else if BytesRead = 0 then
+        begin
+          SafeCloseHandle(StdErrRead);
+          StdErrRead := -1;
+        end;
+      end;
+    end;
+    FProcess.FWriteLock.Enter;
+    try
+      if not Terminated and (Length(FProcess.FWriteBytes) > 0) then
+      begin
+        InpLen := Length(FProcess.FWriteBytes);
+        CloseStdIn := FProcess.FWriteBytes[InpLen - 1] = $04;
+        if CloseStdIn then
+          Dec(InpLen);
+        if InpLen > 0 then
+        begin
+          if __write(StdInWrite, @FProcess.FWriteBytes[0], InpLen) < 0 then
+          begin
+            SafeCloseHandle(StdInWrite);
+            RaiseLastOSError;
+          end;
+        end;
+        FProcess.FWriteBytes := [];
+        if CloseStdIn then
+          SafeCloseHandle(StdInWrite);
+        FProcess.FWriteEvent.SetEvent;
+      end;
+    finally
+      FProcess.FWriteLock.Leave;
+    end;
+    if waitpid(FProcessID, @Status, WNOHANG) <> 0 then
+    begin
+      if WIFEXITED(Status) then
+        FProcess.FExitCode := WEXITSTATUS(Status)
+      else
+        FProcess.FExitCode := FORCED_TERMINATION;
+      Break;
+    end;
+    TThread.Yield;
+  until (StdOutRead = -1) and (StdErrRead = -1);
+
+  if FOutputStream.Size > 0 then
+    FProcess.FOutput := Copy(FOutputStream.Bytes, 0, FOutputStream.Size);
+  if FErrorOutputStream.Size > 0 then
+    FProcess.FErrorOutput := Copy(FErrorOutputStream.Bytes, 0, FErrorOutputStream.Size);
+
+  SafeCloseHandle(StdInWrite);
+  SafeCloseHandle(StdOutRead);
+  SafeCloseHandle(StdErrRead);
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+function CtrlHandler(fdwCtrlType: DWORD): LongBool; stdcall;
+begin
+  Result := True;
+end;
+{$ENDIF}
+
+procedure TProcessThread.RaiseKeyboardInterrupt;
+begin
+  if FProcess.FState = TPPState.Running then
+  begin
+    {$IFDEF MSWINDOWS}
+    if AttachConsole(FProcessInformation.dwProcessId) and
+      SetConsoleCtrlHandler(@CtrlHandler, True) then
+    begin
+      GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
+      Sleep(100);
+      SetConsoleCtrlHandler(@CtrlHandler, False);
+      FreeConsole;
+    end;
+    {$ELSE}
+    kill(FProcessID, SIGINT);
+    {$ENDIF}
+  end;
+end;
 
 procedure TProcessThread.ReadErrorOutput(const Bytes: TBytes; BytesRead: Cardinal);
 begin
@@ -781,9 +1131,13 @@ end;
 
 procedure TProcessThread.TerminatedSet;
 begin
-  // Kill the server when Terminate is called
+  {$IFDEF MSWINDOWS}
   if Started and not Finished and (FProcessInformation.hProcess <> 0) then
     TerminateProcessTree(FProcessInformation.hProcess, FProcessInformation.dwProcessId);
+  {$ELSE}
+  if Started and not Finished and (FProcessID <> 0) then
+    kill(FProcessID, SIGTERM);
+  {$ENDIF}
   inherited;
 end;
 
@@ -812,7 +1166,7 @@ begin
   FProcessPriority := ppNormal;
 
   FEnvironment := TStringList.Create;
-  FWriteLock.Initialize;
+  FWriteLock := TCriticalSection.Create;
   FWriteEvent := TSimpleEvent.Create(nil, False, False, '');
 end;
 
@@ -909,7 +1263,11 @@ end;
 function TPProcess.GetProcessId: Cardinal;
 begin
   if Assigned(FExecThread) then
+  {$IFDEF MSWINDOWS}
     Result := TProcessThread(FExecThread).FProcessInformation.dwProcessId
+  {$ELSE}
+    Result := Cardinal(TProcessThread(FExecThread).FProcessID)
+  {$ENDIF}
   else
     Result := 0;
 end;
@@ -927,6 +1285,12 @@ end;
 function TPProcess.GetState: TPPState;
 begin
   Result := FState;
+end;
+
+procedure TPProcess.RaiseKeyboardInterrupt;
+begin
+  if Assigned(FExecThread) then
+    TProcessThread(FExecThread).RaiseKeyboardInterrupt;
 end;
 
 procedure TPProcess.SetBufferSize(const Value: Cardinal);
@@ -1026,6 +1390,7 @@ begin
 end;
 
 function TPProcess.WaitFor(Timeout: Cardinal = INFINITE): Boolean;
+{$IFDEF MSWINDOWS}
 begin
   if not Assigned(FExecThread) then
     raise PPException.CreateRes(@SWaitFor);
@@ -1046,6 +1411,39 @@ begin
   else
     Result := True;
 end;
+{$ELSE}
+var
+  StartTime: TDateTime;
+  Status: Integer;
+begin
+  if not Assigned(FExecThread) then
+    raise PPException.Create('WaitFor called before calling Execute');
+  while FState = TPPState.Created do
+    TThread.Yield;
+  if FState = TPPState.Running then
+  begin
+    StartTime := Now;
+    Result := False;
+    repeat
+      if waitpid(TProcessThread(FExecThread).FProcessID, @Status, WNOHANG) <> 0 then
+      begin
+        if WIFEXITED(Status) then
+          FExitCode := WEXITSTATUS(Status)
+        else
+          FExitCode := FORCED_TERMINATION;
+        Result := True;
+        Break;
+      end;
+      TThread.Yield;
+    until (Timeout <> INFINITE) and (MilliSecondsBetween(Now, StartTime) >= Timeout);
+    if Result then
+      FExecThread.WaitFor;
+  end
+  else
+    Result := True;
+end;
+{$ENDIF}
+
 
 procedure TPProcess.WriteProcessInput(Bytes: TBytes);
 begin

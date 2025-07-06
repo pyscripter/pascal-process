@@ -10,6 +10,7 @@ There are other pascal components for running processess and redirect their outp
 - Incomplete features and/or over-bloated
 
 ## Features
+- Multi-platform support. Works with all desktop Delphi compilers (WINDOWS, LINUX, MACOS)
 - Asynchronous reading of process output
 - Separate stdout and stderr reading which can optionally be merged
 - Ability to consume output as it is produced or else let it accumulate and read the final result
@@ -17,9 +18,6 @@ There are other pascal components for running processess and redirect their outp
 - Ability to terminate the running process.
 - Synchronous and asynchronous execution of processes.
 - Interfaced-based facilitating memory management.
-
-## Limitations
-Currently the library is Windows only.  The intention is to support other platforms (help wanted).  
 
 ## Installation
 You do not need to install the library. Just download or clone this repo and add the source subdirectory to the Library path.

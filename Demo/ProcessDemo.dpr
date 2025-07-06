@@ -14,7 +14,11 @@ procedure Test1;
 var
   Output: TBytes;
 begin
+  {$IFDEF MSWINDOWS}
   Output := TPProcess.Execute('cmd /c echo Hi');
+  {$ELSE}
+  Output := TPProcess.Execute('echo Hi Ubuntu');
+  {$ENDIF}
   Writeln(TEncoding.ANSI.GetString(Output));
 end;
 
@@ -38,7 +42,11 @@ procedure Test2;
 var
   Process: IPProcess;
 begin
+  {$IFDEF MSWINDOWS}
   Process := TPProcess.Create('cmd /c dir c:\ /s');
+  {$ELSE}
+  Process := TPProcess.Create('ls -l -R /usr');
+  {$ENDIF}
   Process.OnRead := TUtils.OnRead;
   WriteLn('Press Enter to start the process. Press Enter again to terminate');
   ReadLn;

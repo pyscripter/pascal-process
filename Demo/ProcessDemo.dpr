@@ -65,7 +65,10 @@ begin
   Process := TPProcess.Create('notepad.exe');
   Process.ShowWindow := swShowNormal;
   Process.Execute;
-  TThread.Sleep(1000); // So that Process is not destroyed before executed
+  // So that Process is not destroyed before executed
+  while Process.State = TPPState.Created do
+    TThread.Yield;
+  Readln;
   Process.Terminate; // terminates the process but notepad remains open
   Writeln('Ended');
 end;

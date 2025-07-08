@@ -800,6 +800,12 @@ begin
 
   try
     try
+      if Terminated then
+      begin
+        FProcess.FExitCode := FORCED_TERMINATION;
+        Exit;
+      end;
+
       // Create the process
       if not CreateProcess(nil, PChar(FProcess.FCommandline), nil, nil, True,
         Flags, EnvironmentData, PCurrentDir, StartupInfo, FProcessInformation)

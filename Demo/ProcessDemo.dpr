@@ -59,6 +59,8 @@ end;
 
 procedure Test3;
 // Starting a GUI app
+// This is just a test.  PascalProcess is not designed to start GUI apps.
+// Use ShellExecute instead for that purpose.
 var
   Process: IPProcess;
 begin

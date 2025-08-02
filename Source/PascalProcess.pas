@@ -729,6 +729,7 @@ var
   Flags: DWORD;
   InpLen: Cardinal;
   CloseStdIn: Boolean;
+  LWriteBytes: TBytes;
 begin
   NameThreadForDebugging('TProcessThread');
 
@@ -861,30 +862,32 @@ begin
             // Write data to the server
             FProcess.FWriteLock.Enter;
             try
-              if not Terminated and (Length(FProcess.FWriteBytes) > 0) then
-              begin
-                InpLen := Length(FProcess.FWriteBytes);
-                CloseStdIn := FProcess.FWriteBytes[InpLen - 1] = $04 {EOT};
-                if CloseStdIn then
-                  Dec(InpLen);
-
-                if (InpLen > 0) and not
-                  WriteFile(StdInWritePipe, FProcess.FWriteBytes[0], InpLen,
-                  BytesWritten, nil)
-                then
-                begin
-                  SafeCloseHandle(StdInWritePipe);
-                  RaiseLastOSError;
-                end;
-                FProcess.FWriteBytes := [];
-
-                if CloseStdIn then
-                begin
-                  SafeCloseHandle(StdInWritePipe);
-                end;
-              end;
+              LWriteBytes := FProcess.FWriteBytes;
+              SetLength(FProcess.FWriteBytes, 0);
             finally
               FProcess.FWriteLock.Leave;
+            end;
+
+            if not Terminated and (Length(LWriteBytes) > 0) then
+            begin
+              InpLen := Length(LWriteBytes);
+              CloseStdIn := LWriteBytes[InpLen - 1] = $04 {EOT};
+              if CloseStdIn then
+                Dec(InpLen);
+
+              if (InpLen > 0) and not
+                WriteFile(StdInWritePipe, LWriteBytes[0], InpLen,
+                BytesWritten, nil)
+              then
+              begin
+                SafeCloseHandle(StdInWritePipe);
+                RaiseLastOSError;
+              end;
+
+              if CloseStdIn then
+              begin
+                SafeCloseHandle(StdInWritePipe);
+              end;
             end;
           end;
           WAIT_IO_COMPLETION: Continue;
@@ -930,6 +933,7 @@ var
   CloseStdIn: Boolean;
   Status: Integer;
   MaxFD: Integer;
+  LWriteBytes: TBytes;
 begin
   NameThreadForDebugging('TProcessThread');
   FProcess.FState := TPPState.Running;
@@ -1000,7 +1004,7 @@ begin
     FreeMem(Argv);
   end;
 
-  // Now the rest of your read/write loop as before...
+  // Now the rest of the read/write
   SetLength(Buffer, FProcess.FBufferSize);
   repeat
     __FD_ZERO(FDSet);
@@ -1042,30 +1046,33 @@ begin
         end;
       end;
     end;
+
     FProcess.FWriteLock.Enter;
     try
-      if not Terminated and (Length(FProcess.FWriteBytes) > 0) then
-      begin
-        InpLen := Length(FProcess.FWriteBytes);
-        CloseStdIn := FProcess.FWriteBytes[InpLen - 1] = $04;
-        if CloseStdIn then
-          Dec(InpLen);
-        if InpLen > 0 then
-        begin
-          if __write(StdInWrite, @FProcess.FWriteBytes[0], InpLen) < 0 then
-          begin
-            SafeCloseHandle(StdInWrite);
-            RaiseLastOSError;
-          end;
-        end;
-        FProcess.FWriteBytes := [];
-        if CloseStdIn then
-          SafeCloseHandle(StdInWrite);
-        FProcess.FWriteEvent.SetEvent;
-      end;
+      LWriteBytes := FProcess.FWriteBytes;
+      SetLength(FProcess.FWriteBytes, 0);
     finally
       FProcess.FWriteLock.Leave;
     end;
+
+    if not Terminated and (Length(LWriteBytes) > 0) then
+    begin
+      InpLen := Length(LFWriteBytes);
+      CloseStdIn := LWriteBytes[InpLen - 1] = $04;
+      if CloseStdIn then
+        Dec(InpLen);
+      if InpLen > 0 then
+      begin
+        if __write(StdInWrite, @LWriteBytes[0], InpLen) < 0 then
+        begin
+          SafeCloseHandle(StdInWrite);
+          RaiseLastOSError;
+        end;
+      end;
+      if CloseStdIn then
+        SafeCloseHandle(StdInWrite);
+    end;
+
     if waitpid(FProcessID, @Status, WNOHANG) <> 0 then
     begin
       if WIFEXITED(Status) then

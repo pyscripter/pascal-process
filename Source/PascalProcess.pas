@@ -367,10 +367,11 @@ var
 
 // Helper routine to create asynchronous pipes.  From Jcl JclSysUtils
 // Ensures output pipes are zero on failure
-function CreateAsyncPipe(var hReadPipe, hWritePipe: THandle;
-  lpPipeAttributes: PSecurityAttributes; nSize: DWORD): BOOL;
+function CreateAsyncPipePair(var hReadPipe, hWritePipe: THandle;
+  lpPipeAttributes: PSecurityAttributes; nSize: DWORD;
+  IsForReading: Boolean = True): BOOL;
 var
-  Error: DWORD;
+  OpenMode, Flags, Error: DWORD;
   PipeReadHandle, PipeWriteHandle: THandle;
   PipeName: string;
 begin
@@ -384,16 +385,23 @@ begin
 
   // Unique name
   AtomicIncrement(AsyncPipeCounter);
-  PipeName := Format('\\.\Pipe\AsyncAnonPipe.%.8x.%.8x.%.8x',
+  PipeName := Format('\\.\Pipe\AsyncPipe.%.8x.%.8x.%.8x',
     [GetCurrentProcessId, GetCurrentThreadId, AsyncPipeCounter]);
 
-  PipeReadHandle := CreateNamedPipe(PChar(PipeName), PIPE_ACCESS_INBOUND or FILE_FLAG_OVERLAPPED,
+  OpenMode := PIPE_ACCESS_INBOUND;
+  if IsForReading then
+    OpenMode := OpenMode or FILE_FLAG_OVERLAPPED;
+  PipeReadHandle := CreateNamedPipe(PChar(PipeName), OpenMode,
       PIPE_TYPE_BYTE or PIPE_WAIT, 1, nSize, nSize, 120 * 1000, lpPipeAttributes);
   if PipeReadHandle = INVALID_HANDLE_VALUE then
     Exit;
 
-  PipeWriteHandle := CreateFile(PChar(PipeName), GENERIC_WRITE, 0, lpPipeAttributes, OPEN_EXISTING,
-      FILE_ATTRIBUTE_NORMAL {or FILE_FLAG_OVERLAPPED}, 0);
+  Flags := FILE_ATTRIBUTE_NORMAL;
+  if not IsForReading then
+    Flags := Flags or FILE_FLAG_OVERLAPPED;
+  PipeWriteHandle := CreateFile(PChar(PipeName), GENERIC_WRITE, 0,
+    lpPipeAttributes, OPEN_EXISTING, Flags, 0);
+
   if PipeWriteHandle = INVALID_HANDLE_VALUE then
   begin
     Error := GetLastError;
@@ -690,6 +698,21 @@ begin
   then
     SafeCloseHandle(PExtOverlapped(lpOverlapped).PipeHandle^);
 end;
+
+procedure WriteCompletionRoutine(dwErrorCode: DWORD; dwNumberOfBytesTransfered: DWORD;
+  lpOverlapped: POverlapped); stdcall;
+var
+  ExtOverlapped: PExtOverlapped;
+begin
+  ExtOverlapped := PExtOverlapped(lpOverlapped);
+
+  // Check for errors or pipe closure
+  if dwErrorCode <> 0 then
+    SafeCloseHandle(PExtOverlapped(lpOverlapped).PipeHandle^);
+
+  // Cleanup: Free the memory allocated for the structure and the buffer
+  Dispose(ExtOverlapped);
+end;
 {$ENDIF}
 
 destructor TProcessThread.Destroy;
@@ -722,14 +745,13 @@ var
   ReadHandle, WriteHandle: THandle;
   ErrorReadHandle, ErrorWriteHandle: THandle;
   StdInReadPipe, StdInWriteTmpPipe, StdInWritePipe: THandle;
-  BytesWritten: DWORD;
   ExtOverlapped, ExtOverlappedError: TExtOverlapped;
+  ExtWriteOverlapped: PExtOverlapped;
   PCurrentDir: PChar;
   EnvironmentData: PChar;
   Flags: DWORD;
   InpLen: Cardinal;
   CloseStdIn: Boolean;
-  LWriteBytes: TBytes;
 begin
   NameThreadForDebugging('TProcessThread');
 
@@ -741,8 +763,8 @@ begin
   ReadHandle := 0;
   WriteHandle := 0;
   try
-  // Create pipe for writing
-    if not SafeCreatePipe(StdInReadPipe, StdInWriteTmpPipe, @SecurityAttributes, 0) then
+    // Create async pipes for writing
+    if not CreateAsyncPipePair(StdInReadPipe, StdInWriteTmpPipe, @SecurityAttributes, 0, False) then
       RaiseLastOSError;
 
     try
@@ -754,12 +776,12 @@ begin
       SafeCloseHandle(StdInWriteTmpPipe);
     end;
 
-    // Create async pipe for reading stdout
-    if not CreateAsyncPipe(ReadHandle, WriteHandle, @SecurityAttributes, FProcess.FBufferSize) then
+    // Create async pipes for reading stdout
+    if not CreateAsyncPipePair(ReadHandle, WriteHandle, @SecurityAttributes, FProcess.FBufferSize) then
       RaiseLastOSError;
 
-    // Create async pipe for reading stderror
-    if not CreateAsyncPipe(ErrorReadHandle, ErrorWriteHandle, @SecurityAttributes, FProcess.FBufferSize) then
+    // Create async pipes for reading stderror
+    if not CreateAsyncPipePair(ErrorReadHandle, ErrorWriteHandle, @SecurityAttributes, FProcess.FBufferSize) then
       RaiseLastOSError;
   except
     SafeCloseHandle(StdInReadPipe);
@@ -858,41 +880,51 @@ begin
       // Alertable wait so the that read completion interrupts the wait
       case WaitForSingleObjectEx(FProcess.FWriteEvent.Handle, INFINITE, True) of
         WAIT_OBJECT_0:
+          if not Terminated and (Length(FProcess.FWriteBytes) > 0) and
+            (StdInWritePipe <> 0) then
           begin
-            // Write data to the server
+            // Allocate overlapped
+            New(ExtWriteOverlapped);
+            ExtWriteOverlapped.PipeHandle := @StdInWritePipe;
+            ZeroMemory(@ExtWriteOverlapped.Overlapped, SizeOf(TOverlapped));
+
+            // Store the data for writing in ExtWriteOverlapped
             FProcess.FWriteLock.Enter;
             try
-              LWriteBytes := FProcess.FWriteBytes;
+              ExtWriteOverlapped.Buffer := FProcess.FWriteBytes;
               SetLength(FProcess.FWriteBytes, 0);
             finally
               FProcess.FWriteLock.Leave;
             end;
 
-            if not Terminated and (Length(LWriteBytes) > 0) then
-            begin
-              InpLen := Length(LWriteBytes);
-              CloseStdIn := LWriteBytes[InpLen - 1] = $04 {EOT};
-              if CloseStdIn then
-                Dec(InpLen);
+            // Write data to the server
+            InpLen := Length(ExtWriteOverlapped.Buffer);
+            CloseStdIn := ExtWriteOverlapped.Buffer[InpLen - 1] = $04 {EOT};
+            if CloseStdIn then
+              Dec(InpLen);
 
-              if (InpLen > 0) and not
-                WriteFile(StdInWritePipe, LWriteBytes[0], InpLen,
-                BytesWritten, nil)
-              then
+            if InpLen > 0 then
+            begin
+              if not WriteFileEx(StdInWritePipe, @ExtWriteOverlapped.Buffer[0],
+                InpLen, ExtWriteOverlapped.Overlapped,
+                @WriteCompletionRoutine) then
               begin
+                Dispose(ExtWriteOverlapped);
                 SafeCloseHandle(StdInWritePipe);
                 RaiseLastOSError;
               end;
+            end
+            else
+              Dispose(ExtWriteOverlapped);
 
-              if CloseStdIn then
-              begin
-                SafeCloseHandle(StdInWritePipe);
-              end;
+            if CloseStdIn then
+            begin
+              SafeCloseHandle(StdInWritePipe);
             end;
           end;
-          WAIT_IO_COMPLETION: Continue;
-        else
-          RaiseLastOSError;
+        WAIT_IO_COMPLETION: Continue;
+      else
+        RaiseLastOSError;
       end;
     until (ReadHandle = 0) and (ErrorReadHandle = 0);
 

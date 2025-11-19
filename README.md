@@ -14,7 +14,7 @@ There are other pascal components for running processess and redirect their outp
 - Asynchronous reading of process output
 - Separate stdout and stderr reading which can optionally be merged
 - Ability to consume output as it is produced or else let it accumulate and read the final result
-- Ability to provide input to the running process before or while the process is running.
+- Ability to provide input to the running process asynchronously, before or while the process is running.
 - Ability to terminate the running process.
 - Synchronous and asynchronous execution of processes.
 - Interfaced-based facilitating memory management.
@@ -65,7 +65,7 @@ begin
 end;
 
 procedure Test2;
-// Processes ouput as it gets produced
+// Processes output as it gets produced
 // The main thread terminates the process
 var
   Process: IPProcess;
